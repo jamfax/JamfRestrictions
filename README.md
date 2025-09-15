@@ -9,7 +9,7 @@ This is your target config profile. Whether you're adding groups to be exempt or
 
 **Groups**
 Target group you want to have - This will have the config applied
-Empty group - This is good as a backup, but it redundant as (in the case at MTCC) I am directly changing the config profile, instead of a smart group.
+Empty group - This is good as a backup, but it redundant as I am directly changing the config profile, instead of a smart group.
 
 **Exclusions**
 Do you have students that are on leave for any reason? Ensure this user group is referenced. If you do have one of these, ensure you are keeping on top of the membership so kids aren't coming back and not having the config applied to them.
