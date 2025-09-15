@@ -1,0 +1,312 @@
+<# 
+Jamf Profile Scope Scheduler (iOS/macOS) with time & holiday guard
+- OAuth (client credentials)
+- iOS or macOS Classic endpoints
+- AUTO: inside a class window => target group + exclusions
+         outside/holiday/break => empty group + clear exclusions
+- Force Mode: "Add" or "Remove" also supported
+
+PowerShell 5.1 compatible (no ?: or ?? operators).
+#>
+
+# ====== Jamf connection ======
+$JamfUrl      = "https://motherteresa.jamfcloud.com"
+$ClientId     = "7ba8232e-5f3b-4753-a3aa-933be826b736"
+$ClientSecret = "xlOoZMGcjbp3Rmel0h24eD0E8hZvQWfPGhNs9PA0q6vHE9gugCfsH83EI-FtfPEr"
+
+# ====== Which profile? ======
+# "ios" for iOS/iPadOS; "macos" for macOS
+$ProfileType  = "ios"
+$ProfileId    = 110   # <-- your mobile device config profile id
+
+# ====== Groups ======
+$TargetGroupId = 182      # student group to target during allow windows
+$EmptyGroupId  = 42      # safe empty group to avoid "All devices"
+
+# Exclusions:
+# Jamf *mobile device* (or computer, if macOS) GROUP exclusions
+$ExclusionDeviceGroupIds = @(174)   # <-- add your device/computer group IDs here
+# Jamf *JSS user* GROUP exclusions (e.g., sick students)
+$ExclusionUserGroupIds   = @(10)
+
+# ====== Mode & time windows ======
+# "Auto" | "Add" | "Remove"
+$Mode = "Auto"
+
+# Allowed windows (local times). Add/edit as needed.
+$AllowWindows = @(
+    @{ Day="Monday";     Start="08:10"; End="14:55"; Label="Monday" }
+    @{ Day="Tuesday";    Start="08:10"; End="14:55"; Label="Tuesday" }
+    @{ Day="Wednesday";  Start="08:10"; End="14:55"; Label="Wednesday" }
+    @{ Day="Thursday";   Start="08:10"; End="14:55"; Label="Thursday" }
+    @{ Day="Friday";     Start="08:10"; End="14:55"; Label="Friday" }
+)
+
+# Public holidays (YYYY-MM-DD)
+$PublicHolidays = @(
+    "2025-01-01","2025-01-27","2025-03-03","2025-04-18","2025-04-21","2025-04-25",
+    "2025-06-02","2025-09-29","2025-12-25","2025-12-26"
+)
+
+# School holiday ranges (inclusive)
+$SchoolBreaks = @(
+    @{ Start="2025-04-05"; End="2025-04-20" },
+    @{ Start="2025-07-05"; End="2025-07-20" },
+    @{ Start="2025-09-27"; End="2025-10-12" },
+    @{ Start="2025-12-13"; End="2026-02-01" }
+)
+
+# ====== Helpers ======
+function Get-AccessToken {
+  $body = @{ client_id=$ClientId; client_secret=$ClientSecret; grant_type="client_credentials" }
+  $resp = Invoke-RestMethod -Uri "$JamfUrl/api/oauth/token" -Method Post -ContentType "application/x-www-form-urlencoded" -Body $body
+  $resp.access_token
+}
+
+function Get-LocalTimeZone {
+  try { return [System.TimeZoneInfo]::FindSystemTimeZoneById("W. Australia Standard Time") } catch {}
+  try { return [System.TimeZoneInfo]::FindSystemTimeZoneById("Australia/Perth") } catch {}
+  return [System.TimeZoneInfo]::Local
+}
+
+function Parse-HHmm {
+  param([Parameter(Mandatory=$true)][string]$TimeText)
+  if ([string]::IsNullOrWhiteSpace($TimeText)) { throw "Empty/blank time string." }
+  $s = ($TimeText -replace '\s+', ' ').Trim()
+  $formats = @(
+    'HH:mm','H:mm','HHmm','Hmm',
+    'HH.mm','H.mm','HH','H',
+    'h:mm tt','hh:mm tt','h:mmtt','hh:mmtt',
+    'h.mm tt','hh.mm tt','h.mmtt','hh.mmtt'
+  )
+  $cult = [System.Globalization.CultureInfo]::InvariantCulture
+  $styles = [System.Globalization.DateTimeStyles]::None
+  $dt = [datetime]::MinValue
+  foreach ($f in $formats) { if ([datetime]::TryParseExact($s,$f,$cult,$styles,[ref]$dt)) { return $dt } }
+  if ([datetime]::TryParse($s,$cult,$styles,[ref]$dt)) { return $dt }
+  throw "Time '$TimeText' didn't match accepted formats: $($formats -join ', ')"
+}
+
+function Is-PublicHoliday([DateTime]$LocalDate){
+  $PublicHolidays -contains $LocalDate.ToString("yyyy-MM-dd")
+}
+
+function Is-InSchoolBreak([DateTime]$LocalDate){
+  foreach ($r in $SchoolBreaks) {
+    $s = [DateTime]::ParseExact($r.Start,"yyyy-MM-dd",$null)
+    $e = [DateTime]::ParseExact($r.End,  "yyyy-MM-dd",$null)
+    if ($LocalDate.Date -ge $s.Date -and $LocalDate.Date -le $e.Date) { return $true }
+  }
+  $false
+}
+
+function Is-InAllowWindow([DateTime]$NowLocal){
+  $dow = $NowLocal.DayOfWeek.ToString()
+  foreach ($w in $AllowWindows){
+    if ($w.Day -eq $dow){
+      $start = Parse-HHmm $w.Start
+      $end   = Parse-HHmm $w.End
+      $start = [datetime]::new($NowLocal.Year,$NowLocal.Month,$NowLocal.Day,$start.Hour,$start.Minute,0)
+      $end   = [datetime]::new($NowLocal.Year,$NowLocal.Month,$NowLocal.Day,$end.Hour,$end.Minute,0)
+      if ($NowLocal -ge $start -and $NowLocal -le $end){
+        return @{ InWindow=$true; Label=$w.Label }
+      }
+    }
+  }
+  @{ InWindow=$false; Label=$null }
+}
+
+function Get-ClassicBase([string]$ProfileType){
+  switch ($ProfileType.ToLower()) {
+    "ios"   { "mobiledeviceconfigurationprofiles" }
+    "macos" { "osxconfigurationprofiles" }
+    default { throw "ProfileType must be 'ios' or 'macos'." }
+  }
+}
+
+# === XML utilities ===
+function Ensure-Node {
+  param(
+    [System.Xml.XmlNode]$Parent,
+    [string]$Name
+  )
+  $doc = if ($Parent.OwnerDocument) { $Parent.OwnerDocument } else { $Parent }
+  $existing = $Parent.SelectSingleNode($Name)
+  if ($existing) { return $existing }
+  $node = $doc.CreateElement($Name)
+  [void]$Parent.AppendChild($node)
+  return $node
+}
+
+function Get-DeviceGroupContainerName([string]$ProfileType) {
+  if ($ProfileType.ToLower() -eq "ios") { return "mobile_device_groups" }
+  else { return "computer_groups" }
+}
+function Get-DeviceGroupItemName([string]$ProfileType) {
+  if ($ProfileType.ToLower() -eq "ios") { return "mobile_device_group" }
+  else { return "computer_group" }
+}
+function Get-AllFlagName([string]$ProfileType) {
+  if ($ProfileType.ToLower() -eq "ios") { return "all_mobile_devices" }
+  else { return "all_computers" }
+}
+
+function Replace-TargetGroup {
+  param(
+    [System.Xml.XmlNode]$Scope,
+    [string]$ProfileType,
+    [int]$GroupId
+  )
+  $doc = $Scope.OwnerDocument
+  $containerName = Get-DeviceGroupContainerName $ProfileType
+  $itemName      = Get-DeviceGroupItemName $ProfileType
+  $allFlagName   = Get-AllFlagName $ProfileType
+
+  $container = Ensure-Node -Parent $Scope -Name $containerName
+  $container.RemoveAll()
+
+  $g  = $doc.CreateElement($itemName)
+  $id = $doc.CreateElement("id");   $id.InnerText = "$GroupId"
+  $nm = $doc.CreateElement("name"); $nm.InnerText = "Target Group $GroupId"
+  [void]$g.AppendChild($id); [void]$g.AppendChild($nm); [void]$container.AppendChild($g)
+
+  (Ensure-Node -Parent $Scope -Name $allFlagName).InnerText = "false"
+}
+
+function Set-ExclusionJssUserGroups {
+  param(
+    [System.Xml.XmlNode]$Scope,
+    [int[]]$Ids
+  )
+  $doc  = $Scope.OwnerDocument
+  $excl = Ensure-Node -Parent $Scope -Name "exclusions"
+  $jss  = Ensure-Node -Parent $excl  -Name "jss_user_groups"
+  $jss.RemoveAll()
+  foreach ($gid in $Ids) {
+    $g  = $doc.CreateElement("user_group")
+    $id = $doc.CreateElement("id");   $id.InnerText = "$gid"
+    $nm = $doc.CreateElement("name"); $nm.InnerText = "Exclusion Group $gid"
+    [void]$g.AppendChild($id); [void]$g.AppendChild($nm); [void]$jss.AppendChild($g)
+  }
+}
+
+function Set-ExclusionDeviceGroups {
+  param(
+    [System.Xml.XmlNode]$Scope,
+    [string]$ProfileType,
+    [int[]]$Ids
+  )
+  $doc  = $Scope.OwnerDocument
+  $excl = Ensure-Node -Parent $Scope -Name "exclusions"
+
+  $containerName = Get-DeviceGroupContainerName $ProfileType
+  $itemName      = Get-DeviceGroupItemName $ProfileType
+
+  $container = Ensure-Node -Parent $excl -Name $containerName
+  $container.RemoveAll()
+  foreach ($gid in $Ids) {
+    $g  = $doc.CreateElement($itemName)
+    $id = $doc.CreateElement("id");   $id.InnerText = "$gid"
+    $nm = $doc.CreateElement("name"); $nm.InnerText = "Exclusion Group $gid"
+    [void]$g.AppendChild($id); [void]$g.AppendChild($nm); [void]$container.AppendChild($g)
+  }
+}
+
+function Ensure-EmptyExclusionContainers {
+  param(
+    [System.Xml.XmlNode]$Scope,
+    [string]$ProfileType
+  )
+  $excl = Ensure-Node -Parent $Scope -Name "exclusions"
+
+  $containerName = Get-DeviceGroupContainerName $ProfileType
+  [void](Ensure-Node -Parent $excl -Name $containerName)
+  [void](Ensure-Node -Parent $excl -Name "jss_user_groups")
+}
+
+function Clear-Exclusions {
+  param(
+    [System.Xml.XmlNode]$Scope,
+    [string]$ProfileType
+  )
+  $excl = Ensure-Node -Parent $Scope -Name "exclusions"
+
+  $containerName = Get-DeviceGroupContainerName $ProfileType
+  $devNode = $excl.SelectSingleNode($containerName)
+  if (-not $devNode) { $devNode = Ensure-Node -Parent $excl -Name $containerName }
+  $devNode.RemoveAll()
+
+  $jssNode = $excl.SelectSingleNode("jss_user_groups")
+  if (-not $jssNode) { $jssNode = Ensure-Node -Parent $excl -Name "jss_user_groups" }
+  $jssNode.RemoveAll()
+}
+
+# ====== MAIN ======
+$ErrorActionPreference = "Stop"
+
+Write-Host "Getting access token..."
+$Token = Get-AccessToken
+if (-not $Token) { throw "Failed to obtain token." }
+$Headers = @{ Authorization = "Bearer $Token"; Accept = "application/xml" }
+
+$Tz = Get-LocalTimeZone
+$NowLocal = [System.TimeZoneInfo]::ConvertTime([DateTime]::UtcNow, $Tz)
+$today    = $NowLocal.ToString("yyyy-MM-dd")
+
+$holiday = Is-PublicHoliday  $NowLocal
+$break   = Is-InSchoolBreak  $NowLocal
+$inWin   = Is-InAllowWindow  $NowLocal
+
+if ($Mode -eq "Auto") {
+  if ($holiday -or $break) {
+    $EffectiveMode = "Remove"
+    Write-Host "Holiday/break guard active ($today). Forcing REMOVE."
+  } elseif ($inWin.InWindow) {
+    $EffectiveMode = "Add"
+    Write-Host "Inside allow window '$($inWin.Label)' → ADD."
+  } else {
+    $EffectiveMode = "Remove"
+    Write-Host "Outside allow windows → REMOVE."
+  }
+} else {
+  $EffectiveMode = $Mode
+  Write-Host "Mode override: $EffectiveMode"
+}
+
+$ClassicBase = Get-ClassicBase $ProfileType
+$ProfileUrl  = "$JamfUrl/JSSResource/$ClassicBase/id/$ProfileId"
+Write-Host "Fetching profile $ProfileId from $ProfileUrl ..."
+[xml]$ProfileXml = Invoke-RestMethod -Method Get -Uri $ProfileUrl -Headers $Headers
+
+# Work against the document root and scope node
+$root  = $ProfileXml.SelectSingleNode('/*')
+$scope = Ensure-Node -Parent $root -Name "scope"
+
+if ($EffectiveMode -eq "Add") {
+  Replace-TargetGroup -Scope $scope -ProfileType $ProfileType -GroupId $TargetGroupId
+
+  if ($ExclusionDeviceGroupIds -and $ExclusionDeviceGroupIds.Count -gt 0) {
+    Set-ExclusionDeviceGroups -Scope $scope -ProfileType $ProfileType -Ids $ExclusionDeviceGroupIds
+  } else {
+    Ensure-EmptyExclusionContainers -Scope $scope -ProfileType $ProfileType
+  }
+
+  if ($ExclusionUserGroupIds -and $ExclusionUserGroupIds.Count -gt 0) {
+    Set-ExclusionJssUserGroups -Scope $scope -Ids $ExclusionUserGroupIds
+  } else {
+    Ensure-EmptyExclusionContainers -Scope $scope -ProfileType $ProfileType
+  }
+
+  Write-Host ("Applying TARGET group {0}; device-group exclusions: [{1}] ; user-group exclusions: [{2}]" -f `
+    $TargetGroupId, ($ExclusionDeviceGroupIds -join ', '), ($ExclusionUserGroupIds -join ', '))
+}
+else {
+  Replace-TargetGroup -Scope $scope -ProfileType $ProfileType -GroupId $EmptyGroupId
+  Clear-Exclusions -Scope $scope -ProfileType $ProfileType
+  Write-Host "Applying EMPTY group $EmptyGroupId; all exclusions cleared."
+}
+
+Write-Host "Updating profile $ProfileId ..."
+Invoke-RestMethod -Method Put -Uri $ProfileUrl -Headers $Headers -ContentType "application/xml" -Body $ProfileXml.OuterXml
+
+Write-Host ("Done. ({0})  Local time: {1}" -f $EffectiveMode, $NowLocal.ToString('yyyy-MM-dd HH:mm'))
