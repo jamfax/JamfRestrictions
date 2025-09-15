@@ -10,9 +10,9 @@ PowerShell 5.1 compatible (no ?: or ?? operators).
 #>
 
 # ====== Jamf connection ======
-$JamfUrl      = "https://motherteresa.jamfcloud.com"
-$ClientId     = "7ba8232e-5f3b-4753-a3aa-933be826b736"
-$ClientSecret = "xlOoZMGcjbp3Rmel0h24eD0E8hZvQWfPGhNs9PA0q6vHE9gugCfsH83EI-FtfPEr"
+$JamfUrl      = "https://yourinstance.jamfcloud.com"
+$ClientId     = "clientid"
+$ClientSecret = "clientsecret"
 
 # ====== Which profile? ======
 # "ios" for iOS/iPadOS; "macos" for macOS
