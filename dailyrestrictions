@@ -1,0 +1,297 @@
+param(
+  [switch]$DryRun,
+  [switch]$SkipHealthCheck  # use this to skip the initial GET test
+)
+
+# ===================== CONFIG =====================
+$JamfUrl       = "https://YOURINSTANCE.jamfcloud.com"
+$ClientId      = "CLIENTID"
+$ClientSecret  = "CLIENTSECRET"
+
+# Path to the schedule CSV (UTF-8). Columns:
+# ProfileId,ObjectType,Days,Start,End,GroupIds,Name
+$ScheduleCsv   = "C:\Scripts\Jamf Pro API\Camera Permissions\cameraoverrides.csv"
+
+# Optional: if you run week cycles, set $ActiveCycle = "A" or "B" and add a CSV column 'Cycle'
+$ActiveCycle   = $null  # e.g. "A" or "B"
+# ==================================================
+
+$ErrorActionPreference = "Stop"
+if ($JamfUrl.EndsWith("/")) { $JamfUrl = $JamfUrl.TrimEnd("/") }
+
+# Enforce TLS 1.2 (older Windows boxes)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+# ---- Helpers ----
+function Get-AccessToken {
+  param([string]$BaseUrl,[string]$ClientId,[string]$ClientSecret)
+
+  $ClientId     = "$ClientId".Trim()
+  $ClientSecret = "$ClientSecret".Trim()
+
+  function InvokeTokenForm {
+    $body = @{
+      grant_type    = "client_credentials"
+      client_id     = $ClientId
+      client_secret = $ClientSecret
+    }
+    Invoke-RestMethod -Uri "$BaseUrl/api/oauth/token" -Method Post `
+      -ContentType "application/x-www-form-urlencoded" -Body $body
+  }
+  function InvokeTokenBasic {
+    $pair = "{0}:{1}" -f $ClientId, $ClientSecret
+    $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
+    $headers = @{ Authorization = "Basic $basic"; Accept = "application/json" }
+    $body = "grant_type=client_credentials"
+    Invoke-RestMethod -Uri "$BaseUrl/api/oauth/token" -Method Post -Headers $headers `
+      -ContentType "application/x-www-form-urlencoded" -Body $body
+  }
+  try {
+    try { $resp = InvokeTokenForm } catch { $resp = $null }
+    if (-not $resp) { $resp = InvokeTokenBasic }
+    if (-not $resp.access_token) { throw "No access_token in response." }
+    return $resp
+  } catch {
+    if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream()) {
+      $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())
+      $msg = $sr.ReadToEnd()
+      throw "Token request failed: $msg"
+    }
+    throw
+  }
+}
+
+function Ensure-Child {
+  param([xml]$XmlDoc, [System.Xml.XmlNode]$Parent, [string]$ChildName)
+  $node = $Parent.SelectSingleNode($ChildName)
+  if (-not $node) { $node = $XmlDoc.CreateElement($ChildName); [void]$Parent.AppendChild($node) }
+  return $node
+}
+
+function Find-GroupNodeById {
+  param([System.Xml.XmlNode]$GroupsNode, [string]$GroupTag, [int]$Id)
+  foreach ($n in @($GroupsNode.SelectNodes($GroupTag))) {
+    if ($n.SelectSingleNode("id") -and $n.SelectSingleNode("id").InnerText -eq [string]$Id) { return $n }
+  }
+  return $null
+}
+
+function Get-NowLocal {
+  # Windows timezone id for Australia/Perth
+  $tz = [System.TimeZoneInfo]::FindSystemTimeZoneById("W. Australia Standard Time")
+  return [System.TimeZoneInfo]::ConvertTime([datetime]::UtcNow, $tz)
+}
+
+# Map short day tokens to full names
+$dayMap = @{
+  "mon"="Monday"; "tue"="Tuesday"; "wed"="Wednesday"; "thu"="Thursday";
+  "fri"="Friday"; "sat"="Saturday"; "sun"="Sunday"
+}
+
+# ---- Load schedule and compute desired sets (PS5.1-safe) ----
+if (-not (Test-Path $ScheduleCsv)) { throw "CSV not found: $ScheduleCsv" }
+$rows = Import-Csv -Path $ScheduleCsv
+
+$now       = Get-NowLocal
+$todayName = $now.ToString("dddd")
+$baseDate  = $now.ToString('yyyy-MM-dd')
+
+# Rows active "now"
+$activeRows = @()
+foreach ($r in $rows) {
+  # Optional Cycle filter
+  if ($null -ne $ActiveCycle -and ($r.PSObject.Properties.Name -contains 'Cycle')) {
+    $rc = ($r.Cycle | ForEach-Object { "$_".Trim() })
+    if ($rc -and $rc -ne "" -and $rc -ne $ActiveCycle) { continue }
+  }
+
+  # Days
+  $days = @()
+  if ($r.Days) {
+    $days = $r.Days -split "," | ForEach-Object { $_.Trim().ToLower() } | ForEach-Object {
+      if ($dayMap.ContainsKey($_)) { $dayMap[$_] } else { $_ }
+    }
+  }
+  if ($days.Count -gt 0 -and ($days -notcontains $todayName)) { continue }
+
+  # Times (HH:mm)
+  if (-not $r.Start -or -not $r.End) { continue }
+  $startStr = "{0} {1}" -f $baseDate, ($r.Start.Trim())
+  $endStr   = "{0} {1}" -f $baseDate, ($r.End.Trim())
+  try {
+    $start = [datetime]::ParseExact($startStr, "yyyy-MM-dd HH:mm", $null)
+    $end   = [datetime]::ParseExact($endStr,   "yyyy-MM-dd HH:mm", $null)
+  } catch {
+    Write-Warning "Bad time in CSV row: Start='$($r.Start)' End='$($r.End)' Name='$($r.Name)'"
+    continue
+  }
+
+  # In-window (supports overnight if End < Start)
+  $inWindow = $false
+  if ($end -lt $start) {
+    if (($now -ge $start) -or ($now -lt $end.AddDays(1))) { $inWindow = $true }
+  } else {
+    if (($now -ge $start) -and ($now -lt $end)) { $inWindow = $true }
+  }
+  if (-not $inWindow) { continue }
+
+  # Group IDs
+  $gids = @()
+  if ($r.GroupIds) {
+    $gids = $r.GroupIds -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' } | ForEach-Object { [int]$_ }
+  }
+  if ($gids.Count -eq 0) { continue }
+
+  # ObjectType fallback
+  if ($r.PSObject.Properties.Name -contains 'ObjectType' -and $r.ObjectType -and $r.ObjectType.Trim() -ne "") {
+    $objType = $r.ObjectType.Trim()
+  } else {
+    $objType = "Computer"
+  }
+
+  $activeRows += [pscustomobject]@{
+    ProfileId  = [int]$r.ProfileId
+    ObjectType = $objType
+    GroupIds   = $gids
+    Name       = $r.Name
+  }
+}
+
+# Desired exclusions per (ProfileId,ObjectType)
+$desiredByProfile = @{}
+foreach ($row in $activeRows) {
+  $key = "{0}|{1}" -f $row.ProfileId, ($row.ObjectType.ToLower())
+  if (-not $desiredByProfile.ContainsKey($key)) {
+    $desiredByProfile[$key] = New-Object System.Collections.Generic.HashSet[int]
+  }
+  foreach ($gid in $row.GroupIds) { [void]$desiredByProfile[$key].Add($gid) }
+}
+
+# Consider every (ProfileId,ObjectType) present in the CSV, even if none active "now"
+$allProfileKeys = @()
+foreach ($r in $rows) {
+  if ($r.PSObject.Properties.Name -contains 'ObjectType' -and $r.ObjectType -and $r.ObjectType.Trim() -ne "") { $objType2 = $r.ObjectType.Trim() } else { $objType2 = "Computer" }
+  $allProfileKeys += ("{0}|{1}" -f ([int]$r.ProfileId), ($objType2.ToLower()))
+}
+$allProfileKeys = $allProfileKeys | Select-Object -Unique
+
+# ---- Token ----
+Write-Host "Getting access token..."
+$tokObj = Get-AccessToken -BaseUrl $JamfUrl -ClientId $ClientId -ClientSecret $ClientSecret
+$token  = $tokObj.access_token
+if (-not $token) { throw "No access_token in response." }
+
+# ---- Health check (optional) ----
+if (-not $SkipHealthCheck) {
+  $first = $rows | Select-Object -First 1
+  if ($first) {
+    $testProfileId = [int]$first.ProfileId
+    if ($first.PSObject.Properties.Name -contains 'ObjectType' -and $first.ObjectType -and $first.ObjectType.Trim() -ne "") {
+      $otype = $first.ObjectType.Trim().ToLower()
+    } else { $otype = 'computer' }
+    if ($otype -eq 'mobile') {
+      $testUrl = "$JamfUrl/JSSResource/mobiledeviceconfigurationprofiles/id/$testProfileId"
+    } else {
+      $testUrl = "$JamfUrl/JSSResource/osxconfigurationprofiles/id/$testProfileId"
+    }
+    try {
+      $null = Invoke-RestMethod -Method Get -Uri $testUrl -Headers @{ Authorization="Bearer $token"; Accept="application/xml" }
+      Write-Host "Health check OK."
+    } catch {
+      if ($_.Exception.Response -and $_.Exception.Response.GetResponseStream()) {
+        $sr = New-Object IO.StreamReader($_.Exception.Response.GetResponseStream()); $body = $sr.ReadToEnd()
+        Write-Warning "Health check failed. Status: $($_.Exception.Response.StatusCode) Body: $body"
+      } else {
+        Write-Warning "Health check failed: $($_.Exception.Message)"
+      }
+      throw
+    }
+  }
+}
+
+# ---- Sync exclusions for each profile ----
+foreach ($key in $allProfileKeys) {
+  $parts = $key -split "\|"
+  $profileId  = [int]$parts[0]
+  $objType    = $parts[1]
+
+  switch ($objType) {
+    "mobile" {
+      $classicUrl = "$JamfUrl/JSSResource/mobiledeviceconfigurationprofiles/id/$profileId"
+      $allFlag    = "all_mobile_devices"
+      $groupsNode = "mobile_device_groups"
+      $groupNode  = "mobile_device_group"
+    }
+    "computer" {
+      $classicUrl = "$JamfUrl/JSSResource/osxconfigurationprofiles/id/$profileId"
+      $allFlag    = "all_computers"
+      $groupsNode = "computer_groups"
+      $groupNode  = "computer_group"
+    }
+    default { Write-Warning "Skipping unknown ObjectType for $key"; continue }
+  }
+
+  $desired = if ($desiredByProfile.ContainsKey($key)) { $desiredByProfile[$key] } else { New-Object System.Collections.Generic.HashSet[int] }
+
+  [xml]$profile = Invoke-RestMethod -Method Get -Uri $classicUrl `
+    -Headers @{ Authorization="Bearer $token"; Accept="application/xml" }
+
+  $root  = $profile.SelectSingleNode("/*")
+  $scope = $root.SelectSingleNode("scope")
+  if (-not $scope) { $scope = $profile.CreateElement("scope"); [void]$root.AppendChild($scope) }
+
+  $allNode = $scope.SelectSingleNode($allFlag)
+  if (-not $allNode) { $allNode = $profile.CreateElement($allFlag); [void]$scope.AppendChild($allNode) }
+  $allNode.InnerText = "false"
+
+  $exclusions  = Ensure-Child -XmlDoc $profile -Parent $scope -ChildName "exclusions"
+  $exclGroups  = $exclusions.SelectSingleNode($groupsNode)
+  if (-not $exclGroups) { $exclGroups = $profile.CreateElement($groupsNode); [void]$exclusions.AppendChild($exclGroups) }
+
+  # Current -> set
+  $currentIds = New-Object System.Collections.Generic.HashSet[int]
+  foreach ($n in @($exclGroups.SelectNodes($groupNode))) {
+    $idNode = $n.SelectSingleNode("id")
+    if ($idNode -and $idNode.InnerText -match '^\d+$') { [void]$currentIds.Add([int]$idNode.InnerText) }
+  }
+
+  # Diff
+  $toAdd    = @()
+  $toRemove = @()
+  foreach ($gid in $desired)    { if (-not $currentIds.Contains($gid)) { $toAdd    += $gid } }
+  foreach ($gid in $currentIds) { if (-not $desired.Contains($gid))    { $toRemove += $gid } }
+
+  if ($toAdd.Count -eq 0 -and $toRemove.Count -eq 0) {
+    Write-Host "No changes required for profile $profileId"
+    continue
+  }
+
+  if ($DryRun) {
+    Write-Host ("[DryRun] Profile ${profileId}: ADD ({0}) ; REMOVE ({1})" -f ($toAdd -join ','), ($toRemove -join ','))
+    continue
+  }
+
+  foreach ($gid in $toAdd) {
+    $g = $profile.CreateElement($groupNode)
+    $idNode = $profile.CreateElement("id");   $idNode.InnerText = [string]$gid
+    $nmNode = $profile.CreateElement("name"); $nmNode.InnerText = "Exclusion $gid"
+    [void]$g.AppendChild($idNode)
+    [void]$g.AppendChild($nmNode)
+    [void]$exclGroups.AppendChild($g)
+  }
+
+  foreach ($gid in $toRemove) {
+    $existing = Find-GroupNodeById -GroupsNode $exclGroups -GroupTag $groupNode -Id $gid
+    if ($existing) { [void]$exclGroups.RemoveChild($existing) }
+  }
+
+  # PUT back
+  $xmlOut = $profile.OuterXml
+  Invoke-RestMethod -Method Put -Uri $classicUrl `
+    -Headers @{ Authorization="Bearer $token"; Accept="application/xml" } `
+    -ContentType "application/xml" -Body $xmlOut
+
+  Write-Host "Synced exclusions for profile $profileId (added: $($toAdd -join ','), removed: $($toRemove -join ','))"
+}
+
+Write-Host "Done. Active windows enforced for $($now.ToString('ddd HH:mm')))  (DryRun=$DryRun)"
